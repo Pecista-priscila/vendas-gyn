@@ -1,19 +1,22 @@
 """
 Kaizen GO — Calculadora de Desconto Ótimo por Fornecedor
-Lê o CSV/Excel exportado do simulador E e calcula o desconto que maximiza a MC.
+Otimização de portfólio: maximiza MC total sujeito a Fat total >= Fat_atual * (1 + meta_recuperacao).
+Lambda calculado como MC_antes / Fat_antes (período de referência).
+MC sempre positiva por fornecedor (restrição dura).
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import io
+from scipy.optimize import minimize
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Desconto Ótimo — Kaizen GO", page_icon="🎯", layout="wide")
 st.title("🎯 Calculadora de Desconto Ótimo por Fornecedor")
-st.caption("Faça upload do arquivo exportado do simulador (letra E ou O). Colunas esperadas: Fat/dia Antes, Fat/dia Atual, MC/dia Atual, Desc Atual %, ε Obs.")
+st.caption("Otimização de portfólio — maximiza MC total com meta de recuperação de faturamento.")
 
 # ── Upload do arquivo ─────────────────────────────────────────────────────────
 arquivo = st.file_uploader("📂 Selecione o arquivo da análise de fornecedores", type=["csv", "xlsx"])
@@ -50,82 +53,176 @@ df = df.dropna(subset=['Fornecedor', 'Fat/dia Atual', 'MC/dia Atual', 'Desc Atua
 
 # ── Sidebar: parâmetros ───────────────────────────────────────────────────────
 st.sidebar.title("⚙️ Parâmetros")
-usar_margem_minima = st.sidebar.checkbox("Aplicar margem mínima", value=False)
+
+meta_recuperacao = st.sidebar.slider(
+    "Meta de recuperação de Fat (%)",
+    min_value=0, max_value=50, value=10, step=5,
+    help="Quanto % acima do Fat/dia atual você quer atingir. Ex: 10% = Fat_alvo = Fat_atual × 1.10"
+)
+
+usar_margem_minima = st.sidebar.checkbox("Aplicar margem mínima por fornecedor", value=False)
 if usar_margem_minima:
     margem_minima = st.sidebar.number_input(
         "Margem mínima aceitável (%)", min_value=0.0, max_value=30.0, value=5.0, step=0.5,
-        help="Descontos que levem a margem abaixo deste valor serão ignorados."
     )
 else:
-    margem_minima = -999.0  # sem restrição
+    margem_minima = 0.0
+
 eps_padrao = st.sidebar.slider(
     "ε padrão (quando não calculado)", min_value=-15.0, max_value=-0.1, value=-2.0, step=0.1,
-    help="Elasticidade assumida para fornecedores sem ε calculado."
 )
 max_pp = st.sidebar.number_input(
-    "Máximo de pp a testar", min_value=1.0, max_value=20.0, value=15.0, step=1.0,
-    help="Testa de -X pp (reduzir desconto / subir preço) até +X pp (aumentar desconto)."
+    "Máximo de pp a testar", min_value=1.0, max_value=20.0, value=6.0, step=1.0,
 )
 
-# ── Função de cálculo ─────────────────────────────────────────────────────────
-def opt_delta(desc_atual, fat_d, mc_d, eps, margem_min_pct, max_pp=15.0, n=601):
-    """
-    Testa de -max_pp até +max_pp de delta de desconto.
-    Positivo = mais desconto (preço cai), negativo = menos desconto (preço sobe).
-    Retorna o delta que maximiza MC respeitando margem mínima.
-    """
+# ── Funções auxiliares ────────────────────────────────────────────────────────
+def fat_nova(fat_d, eps, desc_atual, delta, denom):
+    novo_desc = desc_atual - delta
+    r = max((1.0 + novo_desc / 100.0) / denom, 0.001)
+    return fat_d * (r ** (1.0 + eps))
+
+def mc_nova(fat_d, mc_d, eps, desc_atual, delta, denom):
     custo_d = fat_d - mc_d
-    if fat_d <= 0 or custo_d < 0 or eps >= 0:
-        return 0.0, fat_d, mc_d
+    novo_desc = desc_atual - delta
+    r = max((1.0 + novo_desc / 100.0) / denom, 0.001)
+    f = fat_d * (r ** (1.0 + eps))
+    c = custo_d * (r ** eps)
+    return f - c
 
-    # CORREÇÃO 1: testa de -max_pp até +max_pp (inclui redução de desconto)
-    deltas = np.linspace(-max_pp, max_pp, n)
-    denom = max(1.0 + desc_atual / 100.0, 0.001)
+# ── Preparar dados ────────────────────────────────────────────────────────────
+df['tem_eps']   = df['ε Obs'].notna()
+df['eps_usado'] = df['ε Obs'].where(df['tem_eps'], eps_padrao)
+df['denom']     = (1.0 + df['Desc Atual %'] / 100.0).clip(lower=0.001)
 
-    melhor_delta = 0.0
-    melhor_mc = mc_d
-    melhor_fat = fat_d
+df['fat_antes_ref'] = df['Fat/dia Antes'].where(
+    df['Fat/dia Antes'].notna() & (df['Fat/dia Antes'] > 0),
+    df['Fat/dia Atual']
+)
 
-    for delta in deltas:
-        novo_desc = desc_atual - delta
-        r = max((1.0 + novo_desc / 100.0) / denom, 0.001)
-        fat_novo = fat_d * (r ** (1.0 + eps))
-        mc_novo = fat_d * (r ** (1.0 + eps)) - custo_d * (r ** eps)
-        margem_nova = mc_novo / fat_novo * 100 if fat_novo > 0 else 0
+# MC antes — estima pela margem atual aplicada ao fat antes se não tiver
+if 'MC/dia Antes' in df.columns and df['MC/dia Antes'].notna().any():
+    df['mc_antes_ref'] = df['MC/dia Antes'].where(
+        df['MC/dia Antes'].notna() & (df['MC/dia Antes'] > 0),
+        df['MC/dia Atual'] / df['Fat/dia Atual'].replace(0, np.nan) * df['fat_antes_ref']
+    )
+else:
+    margem_pct = df['MC/dia Atual'] / df['Fat/dia Atual'].replace(0, np.nan)
+    df['mc_antes_ref'] = margem_pct * df['fat_antes_ref']
 
-        if margem_nova >= margem_min_pct and mc_novo > melhor_mc:
-            melhor_delta = delta
-            melhor_mc = mc_novo
-            melhor_fat = fat_novo
+df['queda_volume'] = (df['Fat/dia Atual'] - df['fat_antes_ref']) / df['fat_antes_ref']
 
-    return melhor_delta, melhor_fat, melhor_mc
+# ── Lambda: MC_antes / Fat_antes ─────────────────────────────────────────────
+mc_antes_total  = df['mc_antes_ref'].sum()
+fat_antes_total = df['fat_antes_ref'].sum()
+lam = mc_antes_total / fat_antes_total if fat_antes_total > 0 else 0.07
 
+# Fat alvo: Fat_atual * (1 + meta_recuperacao%)
+fat_atual_total = df['Fat/dia Atual'].sum()
+fat_alvo = fat_atual_total * (1 + meta_recuperacao / 100.0)
 
-# ── Calcular para cada fornecedor ─────────────────────────────────────────────
-resultados = []
-for _, row in df.iterrows():
-    forn = row['Fornecedor']
-    fat_d = row['Fat/dia Atual']
-    mc_d = row['MC/dia Atual']
-    desc_atual = row['Desc Atual %']
-    eps = row['ε Obs'] if pd.notna(row['ε Obs']) else eps_padrao
-    tem_eps = pd.notna(row['ε Obs'])
+st.sidebar.divider()
+st.sidebar.markdown(f"**λ calculado:** {lam:.4f}")
+st.sidebar.markdown(f"**Fat/dia atual:** R$ {fat_atual_total:,.0f}".replace(",","."))
+st.sidebar.markdown(f"**Fat/dia alvo (+{meta_recuperacao}%):** R$ {fat_alvo:,.0f}".replace(",","."))
+st.sidebar.markdown(f"**Fat/dia Antes (ref):** R$ {fat_antes_total:,.0f}".replace(",","."))
+st.sidebar.caption("λ = MC_antes/Fat_antes. Fat alvo = Fat_atual × (1 + meta%).")
 
-    margem_atual = mc_d / fat_d * 100 if fat_d > 0 else 0
+# ── Otimização de portfólio ───────────────────────────────────────────────────
+rows = df.reset_index(drop=True)
+n_forn = len(rows)
 
-        # Só calcula desconto ótimo se tiver ε real calculado
-    if tem_eps:
-        delta_otimo, fat_otimo, mc_otima = opt_delta(
-            desc_atual, fat_d, mc_d, eps, margem_minima, max_pp
-        )
+# Bounds por fornecedor
+bounds = []
+for i, row in rows.iterrows():
+    queda = row['queda_volume']
+    if queda < 0:
+        max_subida = max(0.5, max_pp * (1 + queda))
     else:
-        delta_otimo, fat_otimo, mc_otima = 0.0, fat_d, mc_d
+        max_subida = max_pp
+    bounds.append((-max_subida, max_pp))
 
-    desc_otimo = desc_atual - delta_otimo
+# Função objetivo: minimiza -(MC_total + λ * Fat_total)
+def objetivo(deltas):
+    total = 0.0
+    for i, row in rows.iterrows():
+        if not row['tem_eps']:
+            total += row['MC/dia Atual'] + lam * row['Fat/dia Atual']
+            continue
+        mc  = mc_nova(row['Fat/dia Atual'], row['MC/dia Atual'],
+                      row['eps_usado'], row['Desc Atual %'], deltas[i], row['denom'])
+        fat = fat_nova(row['Fat/dia Atual'], row['eps_usado'],
+                       row['Desc Atual %'], deltas[i], row['denom'])
+        total += mc + lam * fat
+    return -total
+
+# Restrições
+constraints = []
+
+# 1. Fat total >= fat_alvo
+def restricao_fat(deltas):
+    total_fat = 0.0
+    for i, row in rows.iterrows():
+        if not row['tem_eps']:
+            total_fat += row['Fat/dia Atual']
+            continue
+        total_fat += fat_nova(row['Fat/dia Atual'], row['eps_usado'],
+                              row['Desc Atual %'], deltas[i], row['denom'])
+    return total_fat - fat_alvo
+
+constraints.append({'type': 'ineq', 'fun': restricao_fat})
+
+# 2. MC_i >= margem_minima% do fat (e sempre positiva)
+for i, row in rows.iterrows():
+    if row['tem_eps']:
+        def mc_minima(deltas, idx=i, r=row):
+            fat = fat_nova(r['Fat/dia Atual'], r['eps_usado'],
+                          r['Desc Atual %'], deltas[idx], r['denom'])
+            mc  = mc_nova(r['Fat/dia Atual'], r['MC/dia Atual'],
+                         r['eps_usado'], r['Desc Atual %'], deltas[idx], r['denom'])
+            return mc - max(margem_minima / 100.0, 0.001) * fat
+        constraints.append({'type': 'ineq', 'fun': mc_minima})
+
+# Ponto inicial inteligente — fornecedores que caíram muito começam com desconto inicial
+x0 = np.array([
+    min(max_pp * 0.3, bounds[i][1]) if rows.iloc[i]['queda_volume'] < -0.10 else 0.0
+    for i in range(n_forn)
+])
+
+with st.spinner("Otimizando portfólio..."):
+    resultado = minimize(
+        objetivo, x0,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints,
+        options={'ftol': 1e-6, 'maxiter': 3000}
+    )
+
+deltas_otimos = resultado.x
+
+# ── Montar resultados ─────────────────────────────────────────────────────────
+resultados = []
+for i, row in rows.iterrows():
+    fat_d      = row['Fat/dia Atual']
+    mc_d       = row['MC/dia Atual']
+    desc_atual = row['Desc Atual %']
+    eps        = row['eps_usado']
+    tem_eps    = row['tem_eps']
+    denom      = row['denom']
+
+    if tem_eps:
+        delta_otimo = deltas_otimos[i]
+        fat_otimo   = fat_nova(fat_d, eps, desc_atual, delta_otimo, denom)
+        mc_otima    = mc_nova(fat_d, mc_d, eps, desc_atual, delta_otimo, denom)
+    else:
+        delta_otimo = 0.0
+        fat_otimo   = fat_d
+        mc_otima    = mc_d
+
+    desc_otimo   = desc_atual - delta_otimo
+    margem_atual = mc_d / fat_d * 100 if fat_d > 0 else 0
     margem_otima = mc_otima / fat_otimo * 100 if fat_otimo > 0 else 0
-    ganho_mc = mc_otima - mc_d
+    ganho_mc     = mc_otima - mc_d
 
-    # Classificar ação sugerida
     if abs(delta_otimo) < 0.05:
         acao = "manter"
     elif delta_otimo > 0:
@@ -134,18 +231,18 @@ for _, row in df.iterrows():
         acao = "↓ menos desconto"
 
     resultados.append({
-        'Fornecedor':        forn,
-        'Fat/dia Antes': row.get('Fat/dia Antes', None),
+        'Fornecedor':        row['Fornecedor'],
+        'Fat/dia Antes':     row.get('Fat/dia Antes', None),
         'Fat/dia Atual':     fat_d,
         'MC/dia Atual':      mc_d,
         'Margem Atual %':    margem_atual,
         'Desc Atual %':      desc_atual,
         'ε Obs':             row['ε Obs'] if tem_eps else None,
-        'ε Usado':           eps,
         'Tem ε':             tem_eps,
-        'Δ Desc Ótimo (pp)': delta_otimo,
+        'Queda Volume %':    round(row['queda_volume'] * 100, 1),
+        'Δ Desc Ótimo (pp)': round(delta_otimo, 1),
         'Ação':              acao,
-        'Desc Ótimo %':      desc_otimo,
+        'Desc Ótimo %':      round(desc_otimo, 1),
         'Fat/dia Ótimo':     fat_otimo,
         'MC/dia Ótima':      mc_otima,
         'Margem Ótima %':    margem_otima,
@@ -158,44 +255,57 @@ res = pd.DataFrame(resultados)
 st.divider()
 st.markdown("### 📊 Resumo Geral")
 
-GANHO_MIN = 1.0  # CORREÇÃO 2: só conta ganho real acima de R$1
+GANHO_MIN = 1.0
 
 mc_atual_total  = res['MC/dia Atual'].sum()
 mc_otima_total  = res['MC/dia Ótima'].sum()
 ganho_total     = mc_otima_total - mc_atual_total
-fat_atual_total = res['Fat/dia Atual'].sum()
 fat_otimo_total = res['Fat/dia Ótimo'].sum()
-n_com_eps       = int(res['Tem ε'].sum())
-# CORREÇÃO 3: conta só ganho > R$1
-n_com_ganho     = int((res['Ganho MC/dia'] > GANHO_MIN).sum())
 n_subir_preco   = int((res['Δ Desc Ótimo (pp)'] < -0.05).sum())
 n_mais_desc     = int((res['Δ Desc Ótimo (pp)'] > 0.05).sum())
 
+status_fat = "✅ Meta atingida" if fat_otimo_total >= fat_alvo * 0.99 else "⚠️ Abaixo da meta"
+
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("MC/dia Atual",        f"R$ {mc_atual_total:,.0f}".replace(",","."))
-k2.metric("MC/dia Ótima",        f"R$ {mc_otima_total:,.0f}".replace(",","."),
+k1.metric("MC/dia Atual",                f"R$ {mc_atual_total:,.0f}".replace(",","."))
+k2.metric("MC/dia Ótima",                f"R$ {mc_otima_total:,.0f}".replace(",","."),
           f"+R$ {ganho_total:,.0f}/dia".replace(",","."))
-k3.metric("Fat/dia Atual",       f"R$ {fat_atual_total:,.0f}".replace(",","."))
-k4.metric("Fornec. com ganho",   f"{n_com_ganho} de {len(res)}")
-k5.metric("Sugerem ↓ desconto",  f"{n_subir_preco}")
-k6.metric("Sugerem ↑ desconto",  f"{n_mais_desc}")
+k3.metric("Fat/dia Ótimo",               f"R$ {fat_otimo_total:,.0f}".replace(",","."), status_fat)
+k4.metric(f"Fat/dia Alvo (+{meta_recuperacao}%)", f"R$ {fat_alvo:,.0f}".replace(",","."))
+k5.metric("Sugerem ↓ desconto",          f"{n_subir_preco}")
+k6.metric("Sugerem ↑ desconto",          f"{n_mais_desc}")
+
+if not resultado.success:
+    gap = fat_alvo - fat_otimo_total
+    st.warning(
+        f"⚠️ Otimizador não convergiu completamente. "
+        f"Meta: R$ {fat_alvo:,.0f} · Atingido: R$ {fat_otimo_total:,.0f} · "
+        f"Gap: R$ {gap:,.0f} ({gap/fat_alvo*100:.1f}%). "
+        f"Tente reduzir a meta de recuperação."
+    )
+else:
+    st.success("✅ Otimização convergiu!")
 
 # ── Tabela de resultados ──────────────────────────────────────────────────────
 st.divider()
 st.markdown("### 📋 Desconto Ótimo por Fornecedor")
-st.caption(f"Margem mínima: {margem_minima}% · ε padrão: {eps_padrao} (quando não calculado) · Intervalo testado: -{max_pp:.0f} pp a +{max_pp:.0f} pp")
+st.caption(
+    f"λ = {lam:.4f} (MC_antes/Fat_antes) · ε padrão: {eps_padrao} · "
+    f"Max pp: {max_pp:.0f} · Fat alvo: R$ {fat_alvo:,.0f} (+{meta_recuperacao}% do atual)".replace(",",".")
+)
 
 disp = res[[
-    'Fornecedor', 'Fat/dia Atual', 'MC/dia Atual', 'Margem Atual %',
-    'Desc Atual %', 'ε Obs', 'Δ Desc Ótimo (pp)', 'Ação', 'Desc Ótimo %',
-    'MC/dia Ótima', 'Margem Ótima %', 'Ganho MC/dia'
+    'Fornecedor', 'Fat/dia Antes', 'Fat/dia Atual', 'MC/dia Atual', 'Margem Atual %',
+    'Desc Atual %', 'ε Obs', 'Queda Volume %',
+    'Δ Desc Ótimo (pp)', 'Ação', 'Desc Ótimo %',
+    'Fat/dia Ótimo', 'MC/dia Ótima', 'Margem Ótima %', 'Ganho MC/dia'
 ]].copy().sort_values('Ganho MC/dia', ascending=False)
 
 def cor_ganho(v):
     try:
         fv = float(v)
-        if fv > GANHO_MIN:   return 'background-color:#c6efce; color:#0b5e1e; font-weight:bold'
-        if fv < -GANHO_MIN:  return 'background-color:#ffd6d6; color:#6b0000'
+        if fv > GANHO_MIN:  return 'background-color:#c6efce; color:#0b5e1e; font-weight:bold'
+        if fv < -GANHO_MIN: return 'background-color:#ffd6d6; color:#6b0000'
     except: pass
     return ''
 
@@ -205,16 +315,19 @@ def cor_acao(v):
     return 'color:#888888'
 
 fmt = {
-    'Fat/dia Atual':      lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
-    'MC/dia Atual':       lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
-    'Margem Atual %':     lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
-    'Desc Atual %':       lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
-    'ε Obs':              lambda v: f"{v:.2f}" if pd.notna(v) else "—",
-    'Δ Desc Ótimo (pp)':  lambda v: f"{v:+.1f} pp" if pd.notna(v) else "—",
-    'Desc Ótimo %':       lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
-    'MC/dia Ótima':       lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
-    'Margem Ótima %':     lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
-    'Ganho MC/dia':       lambda v: f"R$ {v:+,.0f}".replace(",",".") if pd.notna(v) else "—",
+    'Fat/dia Antes':     lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
+    'Fat/dia Atual':     lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
+    'MC/dia Atual':      lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
+    'Margem Atual %':    lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
+    'Desc Atual %':      lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
+    'ε Obs':             lambda v: f"{v:.2f}" if pd.notna(v) else "—",
+    'Queda Volume %':    lambda v: f"{v:+.1f}%" if pd.notna(v) else "—",
+    'Δ Desc Ótimo (pp)': lambda v: f"{v:+.1f} pp" if pd.notna(v) else "—",
+    'Desc Ótimo %':      lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
+    'Fat/dia Ótimo':     lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
+    'MC/dia Ótima':      lambda v: f"R$ {v:,.0f}".replace(",",".") if pd.notna(v) else "—",
+    'Margem Ótima %':    lambda v: f"{v:.1f}%" if pd.notna(v) else "—",
+    'Ganho MC/dia':      lambda v: f"R$ {v:+,.0f}".replace(",",".") if pd.notna(v) else "—",
 }
 
 st.dataframe(
