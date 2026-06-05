@@ -135,7 +135,7 @@ def gerar(conn):
         FROM "D-1".prod_ped pp
         JOIN "D-1".cliente c ON pp.codcli = c.codcli
         JOIN "D-1".fornec  f ON pp.codfor = f.codfor
-        WHERE c.sigladesc IN ('O','Q','E','U') AND c.estado = 'GO'
+        WHERE c.sigladesc IN ('O','Q','E','U','K') AND c.estado = 'GO'
           AND (pp.dt_emissao::date BETWEEN '{ini_a_s}' AND '{fim_a_s}'
             OR (pp.dt_emissao::date BETWEEN '{ini_d_s}' AND '{fim_d_s}'
                 AND pp.dt_emissao::date NOT IN ({feriados_sql})))
